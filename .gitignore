@@ -1,0 +1,21 @@
+# Секреты и конфиги
+.env
+*.env
+*.env.local
+
+# Бинарники
+/bin/
+*.exe
+*.dll
+*.so
+
+# Временные файлы
+*.log
+*.pbf
+tmp/
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
