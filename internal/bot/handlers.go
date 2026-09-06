@@ -92,23 +92,23 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Формируем текст с маршрутами
+	// Формируем текст с маршрутами (используем единый формат координат)
 	text := "🚤 *Найдены самые длинные участки без камер!*\n\n"
 
 	for _, seg := range segments {
-		timeMinutes := seg.DistanceKm / 90 * 60
+		// timeMinutes := seg.DistanceKm / 90 * 60
 
 		text += fmt.Sprintf(
 			"*%d. %s* %s\n"+
 				"📏 Длина: *%.1f км*\n"+
 				"⏱ Время: *%.0f мин* (90 км/ч)\n"+
-				"📍 От: %.6f, %.6f\n"+
-				"📍 До: %.6f, %.6f\n\n",
+				"📍 От: `%.6f, %.6f`\n"+
+				"📍 До: `%.6f, %.6f`\n\n",
 			seg.Rank,
 			h.getMedal(seg.Rank),
 			seg.RoadName,
 			seg.DistanceKm,
-			timeMinutes,
+			seg.DurationMin,
 			seg.StartLat, seg.StartLon,
 			seg.EndLat, seg.EndLon,
 		)
@@ -124,9 +124,8 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 
 	for _, seg := range segments {
-		// Создаем ссылки
+		// Создаем ссылку на Яндекс Карты
 		yandexURL := buildYandexMapsLink(seg.StartLat, seg.StartLon, seg.EndLat, seg.EndLon)
-		googleURL := buildGoogleMapsLink(seg.StartLat, seg.StartLon, seg.EndLat, seg.EndLon)
 
 		// Кнопка с Яндекс Картами
 		buttonText := fmt.Sprintf("%s Маршрут #%d (%.1f км) 🗺",
@@ -135,14 +134,21 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 			seg.DistanceKm,
 		)
 
-		row := tgbotapi.NewInlineKeyboardRow(
+		row1 := tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonURL(buttonText, yandexURL),
 		)
-		rows = append(rows, row)
+		rows = append(rows, row1)
 
-		// Дополнительная кнопка с Google Maps (опционально)
+		// Кнопка с координатами для копирования
+		coordsText := fmt.Sprintf("📋 Координаты #%d", seg.Rank)
+		coordsData := fmt.Sprintf("coords_%d_%.6f_%.6f_%.6f_%.6f",
+			seg.Rank,
+			seg.StartLat, seg.StartLon,
+			seg.EndLat, seg.EndLon,
+		)
+
 		row2 := tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL(fmt.Sprintf("📍 Google Maps #%d", seg.Rank), googleURL),
+			tgbotapi.NewInlineKeyboardButtonData(coordsText, coordsData),
 		)
 		rows = append(rows, row2)
 	}
@@ -327,7 +333,7 @@ func (h *Handlers) listCameras(chatID int64) {
 	for i, c := range cameras {
 		msg += fmt.Sprintf(
 			"*%d.* ID: `%d`\n"+
-				"📍 %.6f, %.6f\n"+
+				"📍 `%.6f, %.6f`\n"+
 				"📏 Ограничение: %d км/ч\n"+
 				"🛣 %s\n\n",
 			i+1, c.ID, c.Lat, c.Lon, c.SpeedLimit, c.RoadName,
@@ -354,14 +360,6 @@ func (h *Handlers) getMedal(rank int) string {
 func buildYandexMapsLink(startLat, startLon, endLat, endLon float64) string {
 	return fmt.Sprintf(
 		"https://yandex.ru/maps/?rtext=%.6f,%.6f~%.6f,%.6f&rtt=auto",
-		startLat, startLon, endLat, endLon,
-	)
-}
-
-// buildGoogleMapsLink строит ссылку на Google Maps
-func buildGoogleMapsLink(startLat, startLon, endLat, endLon float64) string {
-	return fmt.Sprintf(
-		"https://www.google.com/maps/dir/%.6f,%.6f/%.6f,%.6f",
 		startLat, startLon, endLat, endLon,
 	)
 }

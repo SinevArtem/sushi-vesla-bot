@@ -9,6 +9,7 @@ import (
 	"sushi-vesla-bot/internal/config"
 	"sushi-vesla-bot/internal/logger"
 	"sushi-vesla-bot/internal/repository"
+	"sushi-vesla-bot/internal/routing"
 	"sushi-vesla-bot/internal/service"
 	"sushi-vesla-bot/pkg/telegram"
 )
@@ -38,11 +39,15 @@ func main() {
 	}
 	logger.Log.Info("✅ Telegram клиент инициализирован")
 
-	// Инициализация сервиса поиска
-	routeFinder := service.NewRouteFinder(camRepo)
+	// Инициализация клиента OSRM
+	router := routing.NewClient(cfg.OSRMURL)
+	logger.Log.Info("✅ OSRM клиент инициализирован")
+
+	// Инициализация сервиса поиска (передаем router)
+	routeFinder := service.NewRouteFinder(camRepo, router)
 	logger.Log.Info("✅ Сервис поиска инициализирован")
 
-	// Инициализация обработчиков (передаем camRepo)
+	// Инициализация обработчиков
 	handlers := bot.NewHandlers(tgClient, routeFinder, camRepo)
 	logger.Log.Info("✅ Обработчики инициализированы")
 

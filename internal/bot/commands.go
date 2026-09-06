@@ -14,15 +14,83 @@ import (
 
 func (h *Handlers) HandleCallback(callback *tgbotapi.CallbackQuery) {
 	chatID := callback.Message.Chat.ID
-	// userID и data не используются, убираем их
+	data := callback.Data
 
 	// Отвечаем на callback (убираем "часики")
 	h.client.GetAPI().Send(tgbotapi.NewCallback(callback.ID, ""))
 
-	// Сейчас у нас нет callback-кнопок, только URL-кнопки
-	// Но на всякий случай обрабатываем
+	// Обработка кнопки "Копировать координаты"
+	if strings.HasPrefix(data, "coords_") {
+		h.handleCopyCoords(chatID, data)
+		return
+	}
+
+	// Сейчас у нас нет других callback-кнопок
 	h.client.SendMessage(chatID, "Выберите действие в главном меню:", "")
 	h.showMainMenu(chatID)
+}
+
+func (h *Handlers) handleCopyCoords(chatID int64, data string) {
+	// Парсим данные: coords_1_55.7558_37.6173_55.7658_37.6273
+	parts := strings.Split(data, "_")
+	if len(parts) != 7 {
+		h.client.SendMessage(chatID, "❌ Ошибка в данных координат", "")
+		return
+	}
+
+	rank := parts[1]
+	startLat, _ := strconv.ParseFloat(parts[2], 64)
+	startLon, _ := strconv.ParseFloat(parts[3], 64)
+	endLat, _ := strconv.ParseFloat(parts[4], 64)
+	endLon, _ := strconv.ParseFloat(parts[5], 64)
+
+	// Форматируем координаты единым стилем
+	coordsText := formatCoordinates(
+		rank,
+		startLat, startLon,
+		endLat, endLon,
+	)
+
+	h.client.SendMessage(chatID, coordsText, "Markdown")
+
+	// Кнопка для быстрого копирования
+	shareText := fmt.Sprintf(
+		"Маршрут #%s: %.6f,%.6f → %.6f,%.6f",
+		rank, startLat, startLon, endLat, endLon,
+	)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonSwitch(
+				"📤 Скопировать всё",
+				shareText,
+			),
+		),
+	)
+
+	h.client.SendMessageWithButtons(chatID, "Или нажмите кнопку, чтобы скопировать всё:", keyboard)
+}
+
+// formatCoordinates - единый формат для всех координат
+func formatCoordinates(rank string, startLat, startLon, endLat, endLon float64) string {
+	return fmt.Sprintf(
+		"📍 *Координаты маршрута #%s*\n\n"+
+			"🚩 *Старт:*\n"+
+			"`%.6f, %.6f`\n\n"+
+			"🏁 *Финиш:*\n"+
+			"`%.6f, %.6f`\n\n"+
+			"📋 *Нажмите на координаты и выберите Копировать*",
+		rank, startLat, startLon, endLat, endLon,
+	)
+}
+
+// formatCoordinatesSimple - упрощенный формат для списка маршрутов
+func formatCoordinatesSimple(startLat, startLon, endLat, endLon float64) string {
+	return fmt.Sprintf(
+		"📍 От: `%.6f, %.6f`\n"+
+			"📍 До: `%.6f, %.6f`",
+		startLat, startLon, endLat, endLon,
+	)
 }
 
 func (h *Handlers) startAddCamera(chatID int64, userID int64) {
@@ -168,7 +236,7 @@ func (h *Handlers) addCameraToDB(chatID int64, userID int64, lat, lon float64, s
 
 	responseMsg := fmt.Sprintf(
 		"✅ *Камера успешно добавлена!*\n\n"+
-			"📍 Координаты: %.6f, %.6f\n"+
+			"📍 Координаты: `%.6f, %.6f`\n"+
 			"📏 Ограничение: %d км/ч\n"+
 			"🆔 ID: %d",
 		lat, lon, speedLimit, id,
@@ -265,10 +333,10 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 	// Очищаем состояние
 	delete(h.userStates, userID)
 
-	// Подтверждение
+	// Подтверждение с единым форматом координат
 	responseMsg := fmt.Sprintf(
 		"✅ *Камера успешно удалена!*\n\n"+
-			"📍 Координаты: %.6f, %.6f\n"+
+			"📍 Координаты: `%.6f, %.6f`\n"+
 			"📏 Ограничение: %d км/ч\n"+
 			"🆔 ID: %d",
 		cameras[0].Lat, cameras[0].Lon, cameras[0].SpeedLimit, cameras[0].ID,
