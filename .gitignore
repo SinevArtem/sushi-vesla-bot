@@ -19,3 +19,5 @@ tmp/
 .idea/
 .vscode/
 *.swp
+
+/data/
