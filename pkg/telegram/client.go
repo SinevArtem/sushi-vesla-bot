@@ -34,11 +34,12 @@ func (c *Client) SendMessage(chatID int64, text string, parseMode string) error 
 
 func (c *Client) SendPhoto(chatID int64, photoBytes []byte, caption string) error {
 	photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{
-		Name:  "horizon.png",
+		Name:  "route.png",
 		Bytes: photoBytes,
 	})
 	if caption != "" {
 		photo.Caption = caption
+		photo.ParseMode = "Markdown"
 	}
 	_, err := c.api.Send(photo)
 	return err

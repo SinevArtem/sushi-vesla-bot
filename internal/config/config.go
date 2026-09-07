@@ -17,7 +17,7 @@ type Config struct {
 	Environment   string
 	SearchRadius  int
 	MaxSegments   int
-	OSRMURL       string // <-- НОВОЕ
+	OSRMURL       string
 }
 
 func Load() *Config {
@@ -34,7 +34,7 @@ func Load() *Config {
 		Environment:   getEnv("ENVIRONMENT", "development"),
 		SearchRadius:  getEnvAsInt("SEARCH_RADIUS", 20000),
 		MaxSegments:   getEnvAsInt("MAX_SEGMENTS", 3),
-		OSRMURL:       getEnv("OSRM_URL", "https://router.project-osrm.org"), // <-- НОВОЕ
+		OSRMURL:       getEnv("OSRM_URL", "https://router.project-osrm.org"),
 	}
 }
 

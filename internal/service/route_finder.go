@@ -37,6 +37,14 @@ func NewRouteFinder(camRepo *repository.CameraRepository, router *routing.Client
 	}
 }
 
+// GetRoute получает маршрут между двумя точками от OSRM
+func (f *RouteFinder) GetRoute(ctx context.Context, startLat, startLon, endLat, endLon float64) (*routing.RouteResult, error) {
+	return f.router.Route(ctx,
+		routing.Coordinate{Lat: startLat, Lon: startLon},
+		routing.Coordinate{Lat: endLat, Lon: endLon},
+	)
+}
+
 func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64, radiusMeters int, limit int) ([]Segment, error) {
 	startTime := time.Now()
 	log.Printf("🔍 Поиск: lat=%.6f, lon=%.6f, radius=%d м", lat, lon, radiusMeters)
@@ -52,6 +60,10 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 	}
 
 	log.Printf("📷 Найдено камер: %d", len(cameras))
+	for idx, cam := range cameras {
+		log.Printf("  Камера ID=%d: (%.6f, %.6f) %s", cam.ID, cam.Lat, cam.Lon, cam.RoadName)
+		_ = idx
+	}
 
 	// 2. Преобразуем камеры в точки для OSRM
 	points := make([]routing.Coordinate, len(cameras))
@@ -63,6 +75,7 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 	}
 
 	// 3. Получаем матрицу дорожных расстояний через OSRM Table
+	log.Printf("📊 Запрос матрицы расстояний к OSRM...")
 	matrix, err := f.router.Table(ctx, points)
 	if err != nil {
 		return nil, fmt.Errorf("получение матрицы маршрутов: %w", err)
@@ -99,11 +112,18 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 
 	log.Printf("📊 Найдено %d пар камер", len(candidates))
 
-	// 6. Проходим по кандидатам и строим маршруты
+	// 6. Проходим по кандидатам
 	var result []Segment
+	checkedCount := 0
+	skippedCount := 0
+
 	for _, candidate := range candidates {
+		checkedCount++
 		camA := cameras[candidate.I]
 		camB := cameras[candidate.J]
+
+		log.Printf("🔍 Проверяем пару ID=%d и ID=%d (расстояние: %.2f км)",
+			camA.ID, camB.ID, candidate.Distance/1000.0)
 
 		// Строим маршрут через OSRM Route
 		route, err := f.router.Route(ctx,
@@ -115,11 +135,18 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 			continue
 		}
 
-		// Проверяем, нет ли промежуточных камер на маршруте
-		if f.hasIntermediateCamera(cameras, candidate.I, candidate.J, route.Geometry) {
-			log.Printf("📷 Маршрут %d -> %d содержит промежуточную камеру, пропускаем", camA.ID, camB.ID)
+		// Проверяем промежуточные камеры
+		intermediateCameras := f.findIntermediateCameras(cameras, candidate.I, candidate.J, route.Geometry)
+
+		if len(intermediateCameras) > 0 {
+			log.Printf("❌ Маршрут %d -> %d содержит %d промежуточных камер: %v",
+				camA.ID, camB.ID, len(intermediateCameras), intermediateCameras)
+			skippedCount++
 			continue
 		}
+
+		log.Printf("✅ Маршрут %d -> %d чист, длина: %.2f км",
+			camA.ID, camB.ID, route.Distance/1000.0)
 
 		// Добавляем в результат
 		roadName := camA.RoadName
@@ -150,33 +177,40 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 	// 7. Присваиваем ранги
 	for i := range result {
 		result[i].Rank = i + 1
-		log.Printf("🏆 Маршрут #%d: %.2f км, %.0f мин", i+1, result[i].DistanceKm, result[i].DurationMin)
+		log.Printf("🏆 Маршрут #%d: %.2f км, %.0f мин (%s)",
+			i+1, result[i].DistanceKm, result[i].DurationMin, result[i].RoadName)
 	}
 
-	log.Printf("⏱ Поиск занял %d мс", time.Since(startTime).Milliseconds())
+	log.Printf("⏱ Поиск занял %d мс, проверено %d пар, пропущено %d (с промежуточными камерами)",
+		time.Since(startTime).Milliseconds(), checkedCount, skippedCount)
 
 	return result, nil
 }
 
-// hasIntermediateCamera проверяет, есть ли на маршруте промежуточные камеры
-func (f *RouteFinder) hasIntermediateCamera(
+// findIntermediateCameras находит все промежуточные камеры на маршруте
+func (f *RouteFinder) findIntermediateCameras(
 	cameras []repository.Camera,
 	startIdx int,
 	endIdx int,
 	geometry []routing.Coordinate,
-) bool {
-	// Проверяем каждую камеру, кроме старта и конца
-	for i, camera := range cameras {
-		if i == startIdx || i == endIdx {
+) []int {
+	var intermediateCameras []int
+
+	if len(geometry) == 0 {
+		return intermediateCameras
+	}
+
+	for idx, camera := range cameras {
+		if idx == startIdx || idx == endIdx {
 			continue
 		}
 
-		if pointNearRoute(camera.Lat, camera.Lon, geometry, 0.0005) { // ~50 метров
-			log.Printf("  📷 Обнаружена промежуточная камера ID=%d", camera.ID)
-			return true
+		if pointNearRoute(camera.Lat, camera.Lon, geometry, 0.0005) {
+			intermediateCameras = append(intermediateCameras, camera.ID)
 		}
 	}
-	return false
+
+	return intermediateCameras
 }
 
 // pointNearRoute проверяет, находится ли точка рядом с маршрутом
@@ -185,7 +219,6 @@ func pointNearRoute(lat, lon float64, geometry []routing.Coordinate, threshold f
 		return false
 	}
 
-	// Проверяем расстояние до каждой точки маршрута
 	for _, p := range geometry {
 		dist := haversineDistance(lat, lon, p.Lat, p.Lon)
 		if dist < threshold {

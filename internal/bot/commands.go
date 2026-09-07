@@ -16,24 +16,114 @@ func (h *Handlers) HandleCallback(callback *tgbotapi.CallbackQuery) {
 	chatID := callback.Message.Chat.ID
 	data := callback.Data
 
+	logger.Log.Info("получен callback",
+		"chat_id", chatID,
+		"data", data,
+	)
+
 	// Отвечаем на callback (убираем "часики")
 	h.client.GetAPI().Send(tgbotapi.NewCallback(callback.ID, ""))
 
-	// Обработка кнопки "Копировать координаты"
+	// Обработка кнопки "Схема"
+	if strings.HasPrefix(data, "schema_") {
+		logger.Log.Info("обработка схемы", "data", data)
+		h.handleSchema(chatID, data)
+		return
+	}
+
+	// Обработка кнопки "Координаты" (если осталась старая)
 	if strings.HasPrefix(data, "coords_") {
+		logger.Log.Info("обработка координат", "data", data)
 		h.handleCopyCoords(chatID, data)
 		return
 	}
 
-	// Сейчас у нас нет других callback-кнопок
 	h.client.SendMessage(chatID, "Выберите действие в главном меню:", "")
 	h.showMainMenu(chatID)
 }
 
-func (h *Handlers) handleCopyCoords(chatID int64, data string) {
-	// Парсим данные: coords_1_55.7558_37.6173_55.7658_37.6273
+// handleSchema - обработка кнопки "Схема" - отправляет картинку с маршрутом
+func (h *Handlers) handleSchema(chatID int64, data string) {
+	logger.Log.Info("генерация схемы", "data", data)
+
+	// Парсим данные: schema_1_56.298795_43.958443_56.242684_43.964236
 	parts := strings.Split(data, "_")
-	if len(parts) != 7 {
+	if len(parts) != 6 {
+		logger.Log.Error("неверный формат данных схемы", "parts", len(parts))
+		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
+		return
+	}
+
+	rank := parts[1]
+	startLat, err := strconv.ParseFloat(parts[2], 64)
+	if err != nil {
+		logger.Log.Error("ошибка парсинга широты старта", "error", err)
+		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
+		return
+	}
+	startLon, err := strconv.ParseFloat(parts[3], 64)
+	if err != nil {
+		logger.Log.Error("ошибка парсинга долготы старта", "error", err)
+		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
+		return
+	}
+	endLat, err := strconv.ParseFloat(parts[4], 64)
+	if err != nil {
+		logger.Log.Error("ошибка парсинга широты финиша", "error", err)
+		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
+		return
+	}
+	endLon, err := strconv.ParseFloat(parts[5], 64)
+	if err != nil {
+		logger.Log.Error("ошибка парсинга долготы финиша", "error", err)
+		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
+		return
+	}
+
+	logger.Log.Info("данные маршрута для схемы",
+		"rank", rank,
+		"startLat", startLat,
+		"startLon", startLon,
+		"endLat", endLat,
+		"endLon", endLon,
+	)
+
+	// Отправляем сообщение о генерации схемы
+	h.client.SendMessage(chatID, "🔄 Генерирую схему маршрута...", "")
+
+	// Получаем геометрию маршрута от OSRM
+	ctx := context.Background()
+	route, err := h.routeFinder.GetRoute(ctx, startLat, startLon, endLat, endLon)
+	if err != nil {
+		logger.Log.Error("ошибка получения маршрута от OSRM", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Не удалось получить маршрут: %v", err), "")
+		return
+	}
+
+	// Генерируем картинку с маршрутом, передавая геометрию
+	imgBytes, err := h.mapGen.GenerateRouteImage(startLat, startLon, endLat, endLon, route.Geometry)
+	if err != nil {
+		logger.Log.Error("ошибка генерации схемы", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка генерации схемы: %v", err), "")
+		return
+	}
+
+	logger.Log.Info("схема сгенерирована", "size", len(imgBytes))
+
+	// Отправляем картинку
+	caption := fmt.Sprintf("🗺 *Схема маршрута #%s*\n\n📍 От: %.6f, %.6f\n📍 До: %.6f, %.6f\n📏 %.1f км",
+		rank, startLat, startLon, endLat, endLon, route.Distance/1000.0)
+
+	if err := h.client.SendPhoto(chatID, imgBytes, caption); err != nil {
+		logger.Log.Error("ошибка отправки схемы", "error", err)
+		h.client.SendMessage(chatID, "❌ Не удалось отправить схему", "")
+	}
+}
+
+// handleCopyCoords - обработка кнопки "Координаты"
+func (h *Handlers) handleCopyCoords(chatID int64, data string) {
+	parts := strings.Split(data, "_")
+	if len(parts) != 6 {
 		h.client.SendMessage(chatID, "❌ Ошибка в данных координат", "")
 		return
 	}
@@ -44,36 +134,7 @@ func (h *Handlers) handleCopyCoords(chatID int64, data string) {
 	endLat, _ := strconv.ParseFloat(parts[4], 64)
 	endLon, _ := strconv.ParseFloat(parts[5], 64)
 
-	// Форматируем координаты единым стилем
-	coordsText := formatCoordinates(
-		rank,
-		startLat, startLon,
-		endLat, endLon,
-	)
-
-	h.client.SendMessage(chatID, coordsText, "Markdown")
-
-	// Кнопка для быстрого копирования
-	shareText := fmt.Sprintf(
-		"Маршрут #%s: %.6f,%.6f → %.6f,%.6f",
-		rank, startLat, startLon, endLat, endLon,
-	)
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonSwitch(
-				"📤 Скопировать всё",
-				shareText,
-			),
-		),
-	)
-
-	h.client.SendMessageWithButtons(chatID, "Или нажмите кнопку, чтобы скопировать всё:", keyboard)
-}
-
-// formatCoordinates - единый формат для всех координат
-func formatCoordinates(rank string, startLat, startLon, endLat, endLon float64) string {
-	return fmt.Sprintf(
+	coordsText := fmt.Sprintf(
 		"📍 *Координаты маршрута #%s*\n\n"+
 			"🚩 *Старт:*\n"+
 			"`%.6f, %.6f`\n\n"+
@@ -82,15 +143,8 @@ func formatCoordinates(rank string, startLat, startLon, endLat, endLon float64) 
 			"📋 *Нажмите на координаты и выберите Копировать*",
 		rank, startLat, startLon, endLat, endLon,
 	)
-}
 
-// formatCoordinatesSimple - упрощенный формат для списка маршрутов
-func formatCoordinatesSimple(startLat, startLon, endLat, endLon float64) string {
-	return fmt.Sprintf(
-		"📍 От: `%.6f, %.6f`\n"+
-			"📍 До: `%.6f, %.6f`",
-		startLat, startLon, endLat, endLon,
-	)
+	h.client.SendMessage(chatID, coordsText, "Markdown")
 }
 
 func (h *Handlers) startAddCamera(chatID int64, userID int64) {
@@ -119,7 +173,6 @@ func (h *Handlers) handleAddCameraInput(msg *tgbotapi.Message) {
 	userID := msg.From.ID
 	text := msg.Text
 
-	// Проверяем отмену
 	if text == "/cancel" {
 		delete(h.userStates, userID)
 		h.client.SendMessage(chatID, "❌ Добавление камеры отменено.", "")
@@ -127,13 +180,11 @@ func (h *Handlers) handleAddCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Если это геолокация
 	if msg.Location != nil {
 		h.handleAddCameraLocation(msg)
 		return
 	}
 
-	// Парсим ввод
 	parts := strings.Split(text, ",")
 	if len(parts) != 3 {
 		h.client.SendMessage(chatID,
@@ -160,7 +211,6 @@ func (h *Handlers) handleAddCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Добавляем камеру
 	h.addCameraToDB(chatID, userID, lat, lon, speedLimit)
 }
 
@@ -170,13 +220,11 @@ func (h *Handlers) handleAddCameraLocation(msg *tgbotapi.Message) {
 	lat := msg.Location.Latitude
 	lon := msg.Location.Longitude
 
-	// Запрашиваем ограничение скорости
 	h.userStates[userID] = "adding_camera_speed"
 	h.client.SendMessage(chatID,
 		fmt.Sprintf("📍 Получены координаты: %.6f, %.6f\n\nВведите ограничение скорости (в км/ч) или 0, если неизвестно:", lat, lon),
 		"")
 
-	// Сохраняем координаты во временное состояние
 	h.cameraTempData[userID] = map[string]float64{
 		"lat": lat,
 		"lon": lon,
@@ -269,7 +317,6 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 	userID := msg.From.ID
 	text := msg.Text
 
-	// Проверяем отмену
 	if text == "/cancel" {
 		delete(h.userStates, userID)
 		h.client.SendMessage(chatID, "❌ Удаление камеры отменено.", "")
@@ -277,7 +324,6 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Парсим ввод
 	parts := strings.Split(text, ",")
 	if len(parts) != 2 {
 		h.client.SendMessage(chatID,
@@ -298,7 +344,6 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Проверяем координаты
 	if lat < -90 || lat > 90 {
 		h.client.SendMessage(chatID, "❌ Широта должна быть в диапазоне от -90 до 90", "")
 		return
@@ -308,7 +353,6 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Ищем камеру
 	ctx := context.Background()
 	cameras, err := h.camRepo.GetCamerasByCoordinates(ctx, lat, lon)
 	if err != nil {
@@ -322,7 +366,6 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Удаляем камеру
 	err = h.camRepo.DeleteCamera(ctx, cameras[0].ID)
 	if err != nil {
 		logger.Log.Error("ошибка удаления камеры", "error", err)
@@ -330,10 +373,8 @@ func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Очищаем состояние
 	delete(h.userStates, userID)
 
-	// Подтверждение с единым форматом координат
 	responseMsg := fmt.Sprintf(
 		"✅ *Камера успешно удалена!*\n\n"+
 			"📍 Координаты: `%.6f, %.6f`\n"+

@@ -21,7 +21,7 @@ type Handlers struct {
 	client         *telegram.Client
 	routeFinder    *service.RouteFinder
 	camRepo        *repository.CameraRepository
-	mapGen         *geo.MapGenerator
+	mapGen         *geo.StaticMapGenerator
 	cfg            *config.Config
 	startTimes     map[int64]time.Time
 	userStates     map[int64]string
@@ -33,7 +33,7 @@ func NewHandlers(client *telegram.Client, routeFinder *service.RouteFinder, camR
 		client:         client,
 		routeFinder:    routeFinder,
 		camRepo:        camRepo,
-		mapGen:         geo.NewMapGenerator(),
+		mapGen:         geo.NewStaticMapGenerator(),
 		cfg:            config.Load(),
 		startTimes:     make(map[int64]time.Time),
 		userStates:     make(map[int64]string),
@@ -56,16 +56,13 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		"lon", lon,
 	)
 
-	// Проверяем, не в режиме ли добавления камеры
 	if state, exists := h.userStates[userID]; exists && state == "adding_camera" {
 		h.handleAddCameraLocation(msg)
 		return
 	}
 
-	// Обычный поиск
 	h.client.SendMessage(chatID, fmt.Sprintf("🔍 Ищем участки в радиусе %d км...", h.cfg.SearchRadius/1000), "")
 
-	// Находим участки
 	ctx := context.Background()
 	segments, err := h.routeFinder.FindLongestSegments(
 		ctx,
@@ -92,16 +89,13 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Формируем текст с маршрутами (используем единый формат координат)
 	text := "🚤 *Найдены самые длинные участки без камер!*\n\n"
 
 	for _, seg := range segments {
-		// timeMinutes := seg.DistanceKm / 90 * 60
-
 		text += fmt.Sprintf(
 			"*%d. %s* %s\n"+
 				"📏 Длина: *%.1f км*\n"+
-				"⏱ Время: *%.0f мин* (90 км/ч)\n"+
+				"⏱ Время: *%.0f мин*\n"+
 				"📍 От: `%.6f, %.6f`\n"+
 				"📍 До: `%.6f, %.6f`\n\n",
 			seg.Rank,
@@ -120,14 +114,11 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		logger.Log.Error("ошибка отправки текста", "error", err)
 	}
 
-	// Создаем кнопки с URL для каждого маршрута
 	var rows [][]tgbotapi.InlineKeyboardButton
 
 	for _, seg := range segments {
-		// Создаем ссылку на Яндекс Карты
 		yandexURL := buildYandexMapsLink(seg.StartLat, seg.StartLon, seg.EndLat, seg.EndLon)
 
-		// Кнопка с Яндекс Картами
 		buttonText := fmt.Sprintf("%s Маршрут #%d (%.1f км) 🗺",
 			h.getMedal(seg.Rank),
 			seg.Rank,
@@ -139,16 +130,15 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		)
 		rows = append(rows, row1)
 
-		// Кнопка с координатами для копирования
-		coordsText := fmt.Sprintf("📋 Координаты #%d", seg.Rank)
-		coordsData := fmt.Sprintf("coords_%d_%.6f_%.6f_%.6f_%.6f",
+		schemaText := fmt.Sprintf("📊 Схема #%d", seg.Rank)
+		schemaData := fmt.Sprintf("schema_%d_%.6f_%.6f_%.6f_%.6f",
 			seg.Rank,
 			seg.StartLat, seg.StartLon,
 			seg.EndLat, seg.EndLon,
 		)
 
 		row2 := tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(coordsText, coordsData),
+			tgbotapi.NewInlineKeyboardButtonData(schemaText, schemaData),
 		)
 		rows = append(rows, row2)
 	}
@@ -159,7 +149,6 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		logger.Log.Error("ошибка отправки кнопок", "error", err)
 	}
 
-	// Показываем главное меню
 	h.showMainMenu(chatID)
 
 	logger.Log.Info("ответ отправлен",
@@ -174,7 +163,6 @@ func (h *Handlers) HandleText(msg *tgbotapi.Message) {
 	userID := msg.From.ID
 	text := msg.Text
 
-	// Проверяем состояние пользователя (для добавления/удаления камер)
 	state, exists := h.userStates[userID]
 
 	if exists && state == "adding_camera" {
@@ -192,7 +180,6 @@ func (h *Handlers) HandleText(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Обработка команд с клавиатуры
 	switch text {
 	case "/start":
 		h.handleStart(chatID)
@@ -207,7 +194,6 @@ func (h *Handlers) HandleText(msg *tgbotapi.Message) {
 	case "📋 Список камер":
 		h.listCameras(chatID)
 	default:
-		// Проверяем, может это координаты?
 		if strings.Contains(text, ",") && !strings.Contains(text, "/") {
 			h.handleCoordinateSearch(chatID, text)
 			return
@@ -235,7 +221,6 @@ func (h *Handlers) handleCoordinateSearch(chatID int64, text string) {
 		return
 	}
 
-	// Создаем фейковое сообщение с геолокацией
 	fakeMsg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: chatID},
 		From: &tgbotapi.User{ID: 0},
@@ -293,7 +278,6 @@ func (h *Handlers) handleHelp(chatID int64) {
 	h.client.SendMessage(chatID, helpMsg, "Markdown")
 }
 
-// showMainMenu - показывает главное меню с кнопками внизу
 func (h *Handlers) showMainMenu(chatID int64) {
 	keyboard := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
@@ -356,7 +340,6 @@ func (h *Handlers) getMedal(rank int) string {
 	}
 }
 
-// buildYandexMapsLink строит ссылку на Яндекс Карты
 func buildYandexMapsLink(startLat, startLon, endLat, endLon float64) string {
 	return fmt.Sprintf(
 		"https://yandex.ru/maps/?rtext=%.6f,%.6f~%.6f,%.6f&rtt=auto",

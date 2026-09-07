@@ -43,7 +43,7 @@ func main() {
 	router := routing.NewClient(cfg.OSRMURL)
 	logger.Log.Info("✅ OSRM клиент инициализирован")
 
-	// Инициализация сервиса поиска (передаем router)
+	// Инициализация сервиса поиска
 	routeFinder := service.NewRouteFinder(camRepo, router)
 	logger.Log.Info("✅ Сервис поиска инициализирован")
 
@@ -56,6 +56,12 @@ func main() {
 
 	go func() {
 		for update := range updates {
+			// Обработка callback запросов (нажатия на кнопки)
+			if update.CallbackQuery != nil {
+				handlers.HandleCallback(update.CallbackQuery)
+				continue
+			}
+
 			if update.Message == nil {
 				continue
 			}
