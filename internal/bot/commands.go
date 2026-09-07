@@ -31,13 +31,6 @@ func (h *Handlers) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	// Обработка кнопки "Координаты" (если осталась старая)
-	if strings.HasPrefix(data, "coords_") {
-		logger.Log.Info("обработка координат", "data", data)
-		h.handleCopyCoords(chatID, data)
-		return
-	}
-
 	h.client.SendMessage(chatID, "Выберите действие в главном меню:", "")
 	h.showMainMenu(chatID)
 }
@@ -46,62 +39,26 @@ func (h *Handlers) HandleCallback(callback *tgbotapi.CallbackQuery) {
 func (h *Handlers) handleSchema(chatID int64, data string) {
 	logger.Log.Info("генерация схемы", "data", data)
 
-	// Парсим данные: schema_1_56.298795_43.958443_56.242684_43.964236
-	parts := strings.Split(data, "_")
-	if len(parts) != 6 {
-		logger.Log.Error("неверный формат данных схемы", "parts", len(parts))
+	// Получаем ID маршрута из данных: schema_abc123
+	routeID := strings.TrimPrefix(data, "schema_")
+	if routeID == data {
+		logger.Log.Error("неверный формат данных схемы", "data", data)
 		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
 		return
 	}
 
-	rank := parts[1]
-	startLat, err := strconv.ParseFloat(parts[2], 64)
-	if err != nil {
-		logger.Log.Error("ошибка парсинга широты старта", "error", err)
-		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
-		return
-	}
-	startLon, err := strconv.ParseFloat(parts[3], 64)
-	if err != nil {
-		logger.Log.Error("ошибка парсинга долготы старта", "error", err)
-		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
-		return
-	}
-	endLat, err := strconv.ParseFloat(parts[4], 64)
-	if err != nil {
-		logger.Log.Error("ошибка парсинга широты финиша", "error", err)
-		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
-		return
-	}
-	endLon, err := strconv.ParseFloat(parts[5], 64)
-	if err != nil {
-		logger.Log.Error("ошибка парсинга долготы финиша", "error", err)
-		h.client.SendMessage(chatID, "❌ Ошибка в данных маршрута", "")
-		return
-	}
-
-	logger.Log.Info("данные маршрута для схемы",
-		"rank", rank,
-		"startLat", startLat,
-		"startLon", startLon,
-		"endLat", endLat,
-		"endLon", endLon,
-	)
-
-	// Отправляем сообщение о генерации схемы
-	h.client.SendMessage(chatID, "🔄 Генерирую схему маршрута...", "")
-
-	// Получаем геометрию маршрута от OSRM
-	ctx := context.Background()
-	route, err := h.routeFinder.GetRoute(ctx, startLat, startLon, endLat, endLon)
-	if err != nil {
-		logger.Log.Error("ошибка получения маршрута от OSRM", "error", err)
-		h.client.SendMessage(chatID, fmt.Sprintf("❌ Не удалось получить маршрут: %v", err), "")
+	// Получаем сегмент из кэша
+	segment, ok := h.routeCache.Get(routeID)
+	if !ok {
+		h.client.SendMessage(chatID, "❌ Маршрут устарел. Выполните поиск ещё раз.", "")
 		return
 	}
 
-	// Генерируем картинку с маршрутом, передавая геометрию
-	imgBytes, err := h.mapGen.GenerateRouteImage(startLat, startLon, endLat, endLon, route.Geometry)
+	// Отправляем сообщение о генерации схемы
+	h.client.SendMessage(chatID, "🗺 Генерирую карту маршрута...", "")
+
+	// Генерируем картинку с маршрутом, используя сохранённую геометрию
+	imgBytes, err := h.mapGen.GenerateRouteImage(segment)
 	if err != nil {
 		logger.Log.Error("ошибка генерации схемы", "error", err)
 		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка генерации схемы: %v", err), "")
@@ -111,40 +68,26 @@ func (h *Handlers) handleSchema(chatID int64, data string) {
 	logger.Log.Info("схема сгенерирована", "size", len(imgBytes))
 
 	// Отправляем картинку
-	caption := fmt.Sprintf("🗺 *Схема маршрута #%s*\n\n📍 От: %.6f, %.6f\n📍 До: %.6f, %.6f\n📏 %.1f км",
-		rank, startLat, startLon, endLat, endLon, route.Distance/1000.0)
+	caption := fmt.Sprintf(
+		"🗺 *Маршрут #%d*\n\n"+
+			"📏 Без камер: *%.1f км*\n"+
+			"⏱ Время: *%.0f мин*\n"+
+			"📍 От: `%.6f, %.6f`\n"+
+			"📍 До: `%.6f, %.6f`",
+		segment.Rank,
+		segment.ClearDistanceKm,
+		segment.DurationMin,
+		segment.StartLat, segment.StartLon,
+		segment.EndLat, segment.EndLon,
+	)
 
 	if err := h.client.SendPhoto(chatID, imgBytes, caption); err != nil {
 		logger.Log.Error("ошибка отправки схемы", "error", err)
 		h.client.SendMessage(chatID, "❌ Не удалось отправить схему", "")
 	}
-}
 
-// handleCopyCoords - обработка кнопки "Координаты"
-func (h *Handlers) handleCopyCoords(chatID int64, data string) {
-	parts := strings.Split(data, "_")
-	if len(parts) != 6 {
-		h.client.SendMessage(chatID, "❌ Ошибка в данных координат", "")
-		return
-	}
-
-	rank := parts[1]
-	startLat, _ := strconv.ParseFloat(parts[2], 64)
-	startLon, _ := strconv.ParseFloat(parts[3], 64)
-	endLat, _ := strconv.ParseFloat(parts[4], 64)
-	endLon, _ := strconv.ParseFloat(parts[5], 64)
-
-	coordsText := fmt.Sprintf(
-		"📍 *Координаты маршрута #%s*\n\n"+
-			"🚩 *Старт:*\n"+
-			"`%.6f, %.6f`\n\n"+
-			"🏁 *Финиш:*\n"+
-			"`%.6f, %.6f`\n\n"+
-			"📋 *Нажмите на координаты и выберите Копировать*",
-		rank, startLat, startLon, endLat, endLon,
-	)
-
-	h.client.SendMessage(chatID, coordsText, "Markdown")
+	// Удаляем маршрут из кэша после использования
+	h.routeCache.Delete(routeID)
 }
 
 func (h *Handlers) startAddCamera(chatID int64, userID int64) {

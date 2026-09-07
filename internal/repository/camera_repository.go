@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
-	"log"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -91,25 +91,65 @@ func (r *CameraRepository) GetAllCameras(ctx context.Context) ([]Camera, error) 
 	return cameras, nil
 }
 
-// AddCamera добавляет новую камеру
-func (r *CameraRepository) AddCamera(ctx context.Context, camera Camera) (int, error) {
-	query := `
-		INSERT INTO cameras (lat, lon, geom, speed_limit, road_name)
-		VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), $3, $4)
-		RETURNING id
-	`
-
-	var id int
-	err := r.pool.QueryRow(ctx, query, camera.Lat, camera.Lon, camera.SpeedLimit, camera.RoadName).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("ошибка добавления камеры: %w", err)
+// GetCamerasNearRoute находит камеры рядом с маршрутом
+func (r *CameraRepository) GetCamerasNearRoute(ctx context.Context, geometry [][]float64, radiusMeters float64) ([]Camera, error) {
+	if len(geometry) < 2 {
+		return nil, fmt.Errorf("геометрия маршрута слишком короткая")
 	}
 
-	log.Printf("✅ Добавлена камера ID=%d: lat=%.6f, lon=%.6f, speed_limit=%d", id, camera.Lat, camera.Lon, camera.SpeedLimit)
-	return id, nil
+	var wkt strings.Builder
+	wkt.WriteString("LINESTRING(")
+
+	for i, p := range geometry {
+		if i > 0 {
+			wkt.WriteString(",")
+		}
+		wkt.WriteString(fmt.Sprintf("%.7f %.7f", p[0], p[1])) // lon, lat
+	}
+
+	wkt.WriteString(")")
+
+	query := `
+		SELECT
+			id,
+			lat,
+			lon,
+			speed_limit,
+			road_name
+		FROM cameras
+		WHERE ST_DWithin(
+			geom::geography,
+			ST_SetSRID(
+				ST_GeomFromText($1),
+				4326
+			)::geography,
+			$2
+		)
+		ORDER BY id
+	`
+
+	rows, err := r.pool.Query(ctx, query, wkt.String(), radiusMeters)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка поиска камер около маршрута: %w", err)
+	}
+	defer rows.Close()
+
+	var cameras []Camera
+	for rows.Next() {
+		var c Camera
+		if err := rows.Scan(&c.ID, &c.Lat, &c.Lon, &c.SpeedLimit, &c.RoadName); err != nil {
+			return nil, fmt.Errorf("ошибка чтения камеры: %w", err)
+		}
+		cameras = append(cameras, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return cameras, nil
 }
 
-// GetCamerasByCoordinates ищет камеры по координатам
 func (r *CameraRepository) GetCamerasByCoordinates(ctx context.Context, lat, lon float64) ([]Camera, error) {
 	query := `
 		SELECT 
@@ -118,7 +158,7 @@ func (r *CameraRepository) GetCamerasByCoordinates(ctx context.Context, lat, lon
 		WHERE ST_DWithin(
 			geom::geography,
 			ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-			50  -- 50 метров допуска
+			50
 		)
 		ORDER BY id
 	`
@@ -142,7 +182,22 @@ func (r *CameraRepository) GetCamerasByCoordinates(ctx context.Context, lat, lon
 	return cameras, nil
 }
 
-// DeleteCamera удаляет камеру по ID
+func (r *CameraRepository) AddCamera(ctx context.Context, camera Camera) (int, error) {
+	query := `
+		INSERT INTO cameras (lat, lon, geom, speed_limit, road_name)
+		VALUES ($1, $2, ST_SetSRID(ST_MakePoint($2, $1), 4326), $3, $4)
+		RETURNING id
+	`
+
+	var id int
+	err := r.pool.QueryRow(ctx, query, camera.Lat, camera.Lon, camera.SpeedLimit, camera.RoadName).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка добавления камеры: %w", err)
+	}
+
+	return id, nil
+}
+
 func (r *CameraRepository) DeleteCamera(ctx context.Context, id int) error {
 	query := `DELETE FROM cameras WHERE id = $1`
 
@@ -155,6 +210,5 @@ func (r *CameraRepository) DeleteCamera(ctx context.Context, id int) error {
 		return fmt.Errorf("камера с ID %d не найдена", id)
 	}
 
-	log.Printf("🗑 Удалена камера ID=%d", id)
 	return nil
 }

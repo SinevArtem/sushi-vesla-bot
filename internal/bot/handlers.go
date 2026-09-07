@@ -23,6 +23,7 @@ type Handlers struct {
 	camRepo        *repository.CameraRepository
 	mapGen         *geo.StaticMapGenerator
 	cfg            *config.Config
+	routeCache     *RouteCache
 	startTimes     map[int64]time.Time
 	userStates     map[int64]string
 	cameraTempData map[int64]map[string]float64
@@ -35,6 +36,7 @@ func NewHandlers(client *telegram.Client, routeFinder *service.RouteFinder, camR
 		camRepo:        camRepo,
 		mapGen:         geo.NewStaticMapGenerator(),
 		cfg:            config.Load(),
+		routeCache:     NewRouteCache(),
 		startTimes:     make(map[int64]time.Time),
 		userStates:     make(map[int64]string),
 		cameraTempData: make(map[int64]map[string]float64),
@@ -95,6 +97,7 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		text += fmt.Sprintf(
 			"*%d. %s* %s\n"+
 				"📏 Длина: *%.1f км*\n"+
+				"🟢 Без камер: *%.1f км*\n"+
 				"⏱ Время: *%.0f мин*\n"+
 				"📍 От: `%.6f, %.6f`\n"+
 				"📍 До: `%.6f, %.6f`\n\n",
@@ -102,6 +105,7 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 			h.getMedal(seg.Rank),
 			seg.RoadName,
 			seg.DistanceKm,
+			seg.ClearDistanceKm,
 			seg.DurationMin,
 			seg.StartLat, seg.StartLon,
 			seg.EndLat, seg.EndLon,
@@ -117,6 +121,10 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 
 	for _, seg := range segments {
+		// Сохраняем маршрут в кэш
+		routeID := h.routeCache.Save(seg)
+
+		// Ссылка на Яндекс Карты (обрезанный маршрут)
 		yandexURL := buildYandexMapsLink(seg.StartLat, seg.StartLon, seg.EndLat, seg.EndLon)
 
 		buttonText := fmt.Sprintf("%s Маршрут #%d (%.1f км) 🗺",
@@ -130,12 +138,9 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		)
 		rows = append(rows, row1)
 
+		// Кнопка "Схема" - использует ID из кэша
 		schemaText := fmt.Sprintf("📊 Схема #%d", seg.Rank)
-		schemaData := fmt.Sprintf("schema_%d_%.6f_%.6f_%.6f_%.6f",
-			seg.Rank,
-			seg.StartLat, seg.StartLon,
-			seg.EndLat, seg.EndLon,
-		)
+		schemaData := fmt.Sprintf("schema_%s", routeID)
 
 		row2 := tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(schemaText, schemaData),
