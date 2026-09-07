@@ -64,16 +64,24 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 		_ = idx
 	}
 
-	// 2. Преобразуем камеры в точки для OSRM
-	points := make([]routing.Coordinate, len(cameras))
+	// 2. Для каждой камеры получаем привязку к дороге через OSRM Nearest
+	roadPoints := make([]routing.Coordinate, len(cameras))
 	for i, camera := range cameras {
-		points[i] = routing.Coordinate{
-			Lat: camera.Lat,
-			Lon: camera.Lon,
+		nearest, err := f.router.Nearest(ctx, camera.Lat, camera.Lon)
+		if err != nil {
+			log.Printf("⚠️ Ошибка Nearest для камеры ID=%d: %v", camera.ID, err)
+			roadPoints[i] = routing.Coordinate{Lat: camera.Lat, Lon: camera.Lon}
+			continue
 		}
+		log.Printf("  Камера ID=%d привязана к дороге: (%.6f, %.6f), расстояние %.2f м",
+			camera.ID, nearest.Coordinate.Lat, nearest.Coordinate.Lon, nearest.Distance)
+		roadPoints[i] = nearest.Coordinate
 	}
 
 	// 3. Получаем матрицу дорожных расстояний через OSRM Table
+	points := make([]routing.Coordinate, len(roadPoints))
+	copy(points, roadPoints)
+
 	log.Printf("📊 Запрос матрицы расстояний к OSRM...")
 	matrix, err := f.router.Table(ctx, points)
 	if err != nil {
@@ -111,7 +119,7 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 
 	log.Printf("📊 Найдено %d пар камер", len(candidates))
 
-	// 6. Проходим по кандидатам
+	// 6. Проходим по кандидатам - НОВАЯ ЛОГИКА
 	var result []Segment
 	checkedCount := 0
 	skippedCount := 0
@@ -120,51 +128,57 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 		checkedCount++
 		camA := cameras[candidate.A]
 		camB := cameras[candidate.B]
+		roadA := roadPoints[candidate.A]
+		roadB := roadPoints[candidate.B]
 
 		log.Printf("🔍 Проверяем пару ID=%d и ID=%d (расстояние: %.2f км)",
 			camA.ID, camB.ID, candidate.Distance/1000.0)
 
-		// Строим маршрут через OSRM Route
-		route, err := f.router.Route(ctx,
-			routing.Coordinate{Lat: camA.Lat, Lon: camA.Lon},
-			routing.Coordinate{Lat: camB.Lat, Lon: camB.Lon},
-		)
+		// Строим маршрут между дорожными точками
+		route, err := f.router.Route(ctx, roadA, roadB)
 		if err != nil {
 			log.Printf("⚠️ Ошибка маршрута %d -> %d: %v", camA.ID, camB.ID, err)
 			continue
 		}
 
-		// Проверяем промежуточные камеры
-		intermediateCameras, err := f.findIntermediateCameras(ctx, camA, camB, route.Geometry)
-		if err != nil {
-			log.Printf("⚠️ Ошибка проверки промежуточных камер: %v", err)
-			continue
-		}
-
-		if len(intermediateCameras) > 0 {
-			log.Printf("❌ Маршрут %d -> %d содержит %d промежуточных камер: %v",
-				camA.ID, camB.ID, len(intermediateCameras), intermediateCameras)
+		// Проверяем промежуточные камеры на маршруте (до камеры B)
+		hasIntermediate, interIdx := f.findFirstIntermediateCamera(cameras, candidate.A, candidate.B, route.Geometry)
+		if hasIntermediate {
+			log.Printf("❌ Маршрут %d -> %d содержит промежуточную камеру ID=%d", camA.ID, camB.ID, cameras[interIdx].ID)
 			skippedCount++
 			continue
 		}
 
-		// Обрезаем маршрут на 50 метров с каждого конца
-		clearGeometry, clearDistance, ok := trimRoute(route.Geometry, CameraRadiusMeters, CameraRadiusMeters)
+		// Обрезаем маршрут при входе в зону камеры B
+		cutGeometry, cutDistance, ok := routing.CutRouteAtCircle(
+			route.Geometry,
+			camB.Lat, camB.Lon,
+			CameraRadiusMeters,
+		)
+
 		if !ok {
 			log.Printf("⚠️ Не удалось обрезать маршрут %d -> %d", camA.ID, camB.ID)
 			skippedCount++
 			continue
 		}
 
-		if clearDistance < MinClearDistanceMeters {
-			log.Printf("⚠️ Маршрут %d -> %d слишком короткий после обрезки: %.0f м", camA.ID, camB.ID, clearDistance)
+		if cutDistance < MinClearDistanceMeters {
+			log.Printf("⚠️ Маршрут %d -> %d слишком короткий: %.0f м", camA.ID, camB.ID, cutDistance)
 			skippedCount++
 			continue
 		}
 
-		// Определяем начало и конец чистого участка
-		start := clearGeometry[0]
-		end := clearGeometry[len(clearGeometry)-1]
+		// Находим начало и конец обрезанного маршрута
+		start := cutGeometry[0]
+		end := cutGeometry[len(cutGeometry)-1]
+
+		// Проверяем, что камера A не в зоне камеры B
+		distAtoB := routing.HaversineMeters(camA.Lat, camA.Lon, camB.Lat, camB.Lon)
+		if distAtoB < CameraRadiusMeters {
+			log.Printf("⚠️ Камеры %d и %d слишком близко: %.0f м", camA.ID, camB.ID, distAtoB)
+			skippedCount++
+			continue
+		}
 
 		roadName := camA.RoadName
 		if roadName == "" {
@@ -174,12 +188,29 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 			roadName = "Неизвестная дорога"
 		}
 
-		log.Printf("✅ Маршрут %d -> %d чист, длина: %.2f км (чистый участок: %.2f км)",
-			camA.ID, camB.ID, route.Distance/1000.0, clearDistance/1000.0)
+		log.Printf("📍 Камера A: (%.6f, %.6f) [ID=%d]", camA.Lat, camA.Lon, camA.ID)
+		log.Printf("📍 Камера B: (%.6f, %.6f) [ID=%d]", camB.Lat, camB.Lon, camB.ID)
+		log.Printf("📍 START: (%.6f, %.6f)", start.Lat, start.Lon)
+		log.Printf("📍 END: (%.6f, %.6f) - вход в зону камеры B", end.Lat, end.Lon)
+		log.Printf("✅ Маршрут %d -> %d, длина: %.2f км (чистый: %.2f км)",
+			camA.ID, camB.ID, route.Distance/1000.0, cutDistance/1000.0)
+
+		// Для чистого расстояния вычитаем 50 метров от камеры A
+		clearStartPoint, _ := routing.PointAtDistance(cutGeometry, CameraRadiusMeters)
+		clearDistance := cutDistance - CameraRadiusMeters
+
+		if clearDistance < MinClearDistanceMeters {
+			log.Printf("⚠️ Маршрут %d -> %d слишком короткий после вычета зоны A: %.0f м", camA.ID, camB.ID, clearDistance)
+			skippedCount++
+			continue
+		}
+
+		// Собираем обрезанную геометрию
+		clearGeometry := f.buildClearGeometry(cutGeometry, CameraRadiusMeters, 0)
 
 		result = append(result, Segment{
-			StartLat:        start.Lat,
-			StartLon:        start.Lon,
+			StartLat:        clearStartPoint.Lat,
+			StartLon:        clearStartPoint.Lon,
 			EndLat:          end.Lat,
 			EndLon:          end.Lon,
 			DistanceKm:      route.Distance / 1000.0,
@@ -213,56 +244,67 @@ func (f *RouteFinder) FindLongestSegments(ctx context.Context, lat, lon float64,
 	return result, nil
 }
 
-// findIntermediateCameras находит промежуточные камеры на маршруте
-func (f *RouteFinder) findIntermediateCameras(
-	ctx context.Context,
-	start repository.Camera,
-	end repository.Camera,
+// findFirstIntermediateCamera находит первую промежуточную камеру на маршруте
+func (f *RouteFinder) findFirstIntermediateCamera(
+	cameras []repository.Camera,
+	startIdx int,
+	endIdx int,
 	geometry []routing.Coordinate,
-) ([]int, error) {
+) (bool, int) {
 	if len(geometry) < 2 {
-		return nil, nil
+		return false, -1
 	}
 
-	// Преобразуем геометрию в формат для PostGIS
-	geomCoords := make([][]float64, len(geometry))
-	for i, p := range geometry {
-		geomCoords[i] = []float64{p.Lon, p.Lat}
+	// Проверяем все камеры, кроме старта и конца
+	for idx, camera := range cameras {
+		if idx == startIdx || idx == endIdx {
+			continue
+		}
+
+		// Проверяем расстояние от камеры до маршрута
+		dist := routing.DistancePointToPolyline(camera.Lat, camera.Lon, geometry)
+		if dist < IntermediateCameraRadius {
+			log.Printf("  📷 Найдена промежуточная камера ID=%d (расстояние %.2f м)", camera.ID, dist)
+			return true, idx
+		}
 	}
 
-	// Получаем камеры рядом с маршрутом
-	cameras, err := f.camRepo.GetCamerasNearRoute(ctx, geomCoords, IntermediateCameraRadius)
-	if err != nil {
-		return nil, err
+	return false, -1
+}
+
+// buildClearGeometry собирает обрезанную геометрию
+func (f *RouteFinder) buildClearGeometry(geometry []routing.Coordinate, startOffset, endOffset float64) []routing.Coordinate {
+	if len(geometry) < 2 {
+		return geometry
 	}
 
-	routeLengthMeters := routeLength(geometry)
-	var intermediate []int
+	// Находим точки на маршруте
+	startPoint, _ := routing.PointAtDistance(geometry, startOffset)
 
-	for _, camera := range cameras {
-		if camera.ID == start.ID || camera.ID == end.ID {
-			continue
-		}
-
-		projection, ok := projectPointToRoute(camera.Lat, camera.Lon, geometry)
-		if !ok {
-			continue
-		}
-
-		if projection.DistanceTo > IntermediateCameraRadius {
-			continue
-		}
-
-		// Камера должна быть внутри маршрута, а не рядом с концами
-		if projection.DistanceAlong <= CameraRadiusMeters {
-			continue
-		}
-		if projection.DistanceAlong >= routeLengthMeters-CameraRadiusMeters {
-			continue
-		}
-
-		intermediate = append(intermediate, camera.ID)
+	// Если endOffset > 0, обрезаем с конца
+	var endPoint routing.Coordinate
+	if endOffset > 0 {
+		totalLen := routing.RouteLength(geometry)
+		endPoint, _ = routing.PointAtDistance(geometry, totalLen-endOffset)
+	} else {
+		endPoint = geometry[len(geometry)-1]
 	}
 
-	return intermediate, nil
+	// Собираем обрезанную геометрию
+	result := []routing.Coordinate{startPoint}
+
+	for i := 1; i < len(geometry)-1; i++ {
+		// Проверяем, не вышли ли за пределы
+		distFromStart := routing.HaversineMeters(startPoint.Lat, startPoint.Lon, geometry[i].Lat, geometry[i].Lon)
+		distFromEnd := routing.HaversineMeters(endPoint.Lat, endPoint.Lon, geometry[i].Lat, geometry[i].Lon)
+
+		// Если точка между startPoint и endPoint
+		if distFromStart < routing.RouteLength(geometry) && distFromEnd < routing.RouteLength(geometry) {
+			result = append(result, geometry[i])
+		}
+	}
+
+	result = append(result, endPoint)
+
+	return result
 }

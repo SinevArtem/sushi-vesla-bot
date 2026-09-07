@@ -26,6 +26,11 @@ type RouteResult struct {
 	Geometry []Coordinate
 }
 
+type NearestResult struct {
+	Coordinate Coordinate
+	Distance   float64 // в метрах
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -166,5 +171,62 @@ func (c *Client) Route(ctx context.Context, start, end Coordinate) (*RouteResult
 		Distance: r.Distance,
 		Duration: r.Duration,
 		Geometry: geometry,
+	}, nil
+}
+
+// Nearest привязывает координату к дорожной сети OSRM
+func (c *Client) Nearest(ctx context.Context, lat, lon float64) (*NearestResult, error) {
+	url := fmt.Sprintf(
+		"%s/nearest/v1/driving/%.6f,%.6f?number=1",
+		c.baseURL, lon, lat,
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("создание nearest запроса: %w", err)
+	}
+	req.Header.Set("User-Agent", "SushiVeslaBot/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("nearest request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OSRM nearest HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Code      string `json:"code"`
+		Waypoints []struct {
+			Location []float64 `json:"location"` // [lon, lat]
+			Distance float64   `json:"distance"`
+		} `json:"waypoints"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode nearest response: %w", err)
+	}
+
+	if result.Code != "Ok" {
+		return nil, fmt.Errorf("OSRM nearest code: %s", result.Code)
+	}
+
+	if len(result.Waypoints) == 0 {
+		return nil, fmt.Errorf("OSRM не вернул точку на дороге")
+	}
+
+	wp := result.Waypoints[0]
+	if len(wp.Location) != 2 {
+		return nil, fmt.Errorf("неверный формат Location")
+	}
+
+	return &NearestResult{
+		Coordinate: Coordinate{
+			Lat: wp.Location[1],
+			Lon: wp.Location[0],
+		},
+		Distance: wp.Distance,
 	}, nil
 }
