@@ -58,3 +58,10 @@ func (c *Client) GetUpdatesChan() tgbotapi.UpdatesChannel {
 	u.Timeout = 60
 	return c.api.GetUpdatesChan(u)
 }
+
+// DeleteMessage удаляет сообщение
+func (c *Client) DeleteMessage(chatID int64, messageID int) error {
+	msg := tgbotapi.NewDeleteMessage(chatID, messageID)
+	_, err := c.api.Send(msg)
+	return err
+}

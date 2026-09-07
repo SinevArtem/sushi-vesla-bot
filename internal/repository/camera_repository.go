@@ -212,3 +212,39 @@ func (r *CameraRepository) DeleteCamera(ctx context.Context, id int) error {
 
 	return nil
 }
+
+// CheckCameraNearby проверяет, есть ли камера рядом с заданными координатами
+func (r *CameraRepository) CheckCameraNearby(ctx context.Context, lat, lon float64, minDistanceMeters float64) (bool, Camera, error) {
+	query := `
+		SELECT 
+			id, lat, lon, speed_limit, road_name
+		FROM cameras
+		WHERE ST_DWithin(
+			geom::geography,
+			ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+			$3
+		)
+		ORDER BY ST_Distance(
+			geom::geography,
+			ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+		)
+		LIMIT 1
+	`
+
+	rows, err := r.pool.Query(ctx, query, lon, lat, minDistanceMeters)
+	if err != nil {
+		return false, Camera{}, fmt.Errorf("ошибка проверки камеры: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var c Camera
+		err := rows.Scan(&c.ID, &c.Lat, &c.Lon, &c.SpeedLimit, &c.RoadName)
+		if err != nil {
+			return false, Camera{}, fmt.Errorf("ошибка сканирования: %w", err)
+		}
+		return true, c, nil
+	}
+
+	return false, Camera{}, nil
+}

@@ -24,9 +24,18 @@ type Handlers struct {
 	mapGen         *geo.StaticMapGenerator
 	cfg            *config.Config
 	routeCache     *RouteCache
+	sessionCache   *SessionCache
+	pageStates     map[int64]*PageState
 	startTimes     map[int64]time.Time
 	userStates     map[int64]string
 	cameraTempData map[int64]map[string]float64
+}
+
+type PageState struct {
+	MessageID   int
+	SessionID   string
+	CurrentPage int
+	TotalPages  int
 }
 
 func NewHandlers(client *telegram.Client, routeFinder *service.RouteFinder, camRepo *repository.CameraRepository) *Handlers {
@@ -37,6 +46,8 @@ func NewHandlers(client *telegram.Client, routeFinder *service.RouteFinder, camR
 		mapGen:         geo.NewStaticMapGenerator(),
 		cfg:            config.Load(),
 		routeCache:     NewRouteCache(),
+		sessionCache:   &SessionCache{sessions: make(map[string]*SessionData)},
+		pageStates:     make(map[int64]*PageState),
 		startTimes:     make(map[int64]time.Time),
 		userStates:     make(map[int64]string),
 		cameraTempData: make(map[int64]map[string]float64),
@@ -66,11 +77,12 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 	h.client.SendMessage(chatID, fmt.Sprintf("🔍 Ищем участки в радиусе %d км...", h.cfg.SearchRadius/1000), "")
 
 	ctx := context.Background()
-	segments, err := h.routeFinder.FindLongestSegments(
+
+	allSegments, err := h.routeFinder.FindLongestSegmentsParallel(
 		ctx,
 		lat, lon,
 		h.cfg.SearchRadius,
-		h.cfg.MaxSegments,
+		10,
 	)
 
 	if err != nil {
@@ -82,7 +94,7 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		return
 	}
 
-	if len(segments) == 0 {
+	if len(allSegments) == 0 {
 		h.client.SendMessage(chatID,
 			fmt.Sprintf("😕 В радиусе %d км не найдено участков без камер.\n\n📷 Помогите сообществу - добавьте камеры в вашем районе!",
 				h.cfg.SearchRadius/1000),
@@ -91,22 +103,54 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		return
 	}
 
+	sessionID := h.sessionCache.SaveSession(chatID, allSegments)
+	h.showRoutePage(chatID, sessionID, 0)
+	h.showMainMenu(chatID)
+
+	logger.Log.Info("ответ отправлен",
+		"user_id", userID,
+		"total_segments", len(allSegments),
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+}
+
+func (h *Handlers) showRoutePage(chatID int64, sessionID string, page int) {
+	segments, ok := h.sessionCache.GetPage(sessionID, page)
+	if !ok || len(segments) == 0 {
+		h.client.SendMessage(chatID, "😕 Больше маршрутов нет.", "")
+		return
+	}
+
+	sessionData, _ := h.sessionCache.GetSession(sessionID)
+	currentPage := sessionData.CurrentPage
+	totalPages := sessionData.TotalPages
+	// totalCount := sessionData.TotalCount
+
 	text := "🚤 *Найдены самые длинные участки без камер!*\n\n"
 
-	for _, seg := range segments {
+	for rankOffset, seg := range segments {
+		actualRank := currentPage*3 + rankOffset + 1
+
+		medal := ""
+		switch actualRank {
+		case 1:
+			medal = "🥇 "
+		case 2:
+			medal = "🥈 "
+		case 3:
+			medal = "🥉 "
+		default:
+			medal = fmt.Sprintf("%d. ", actualRank)
+		}
+
 		text += fmt.Sprintf(
-			"*%d. %s* %s\n"+
+			"*%s* %s\n"+
 				"📏 Длина: *%.1f км*\n"+
-				"🟢 Без камер: *%.1f км*\n"+
-				"⏱ Время: *%.0f мин*\n"+
 				"📍 От: `%.6f, %.6f`\n"+
 				"📍 До: `%.6f, %.6f`\n\n",
-			seg.Rank,
-			h.getMedal(seg.Rank),
+			medal,
 			seg.RoadName,
 			seg.DistanceKm,
-			seg.ClearDistanceKm,
-			seg.DurationMin,
 			seg.StartLat, seg.StartLon,
 			seg.EndLat, seg.EndLon,
 		)
@@ -114,32 +158,25 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 
 	text += "👇 *Нажмите на кнопку с маршрутом для открытия в навигаторе:*"
 
-	if err := h.client.SendMessage(chatID, text, "Markdown"); err != nil {
-		logger.Log.Error("ошибка отправки текста", "error", err)
+	if totalPages > 1 {
+		text += fmt.Sprintf("\n\n📊 Страница *%d/%d*", currentPage+1, totalPages)
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 
-	for _, seg := range segments {
-		// Сохраняем маршрут в кэш
+	for rankOffset, seg := range segments {
+		actualRank := currentPage*3 + rankOffset + 1
 		routeID := h.routeCache.Save(seg)
 
-		// Ссылка на Яндекс Карты (обрезанный маршрут)
 		yandexURL := buildYandexMapsLink(seg.StartLat, seg.StartLon, seg.EndLat, seg.EndLon)
-
-		buttonText := fmt.Sprintf("%s Маршрут #%d (%.1f км) 🗺",
-			h.getMedal(seg.Rank),
-			seg.Rank,
-			seg.DistanceKm,
-		)
+		buttonText := fmt.Sprintf("🗺 Маршрут #%d (%.1f км)", actualRank, seg.DistanceKm)
 
 		row1 := tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonURL(buttonText, yandexURL),
 		)
 		rows = append(rows, row1)
 
-		// Кнопка "Схема" - использует ID из кэша
-		schemaText := fmt.Sprintf("📊 Схема #%d", seg.Rank)
+		schemaText := fmt.Sprintf("📊 Схема #%d", actualRank)
 		schemaData := fmt.Sprintf("schema_%s", routeID)
 
 		row2 := tgbotapi.NewInlineKeyboardRow(
@@ -148,19 +185,58 @@ func (h *Handlers) HandleLocation(msg *tgbotapi.Message) {
 		rows = append(rows, row2)
 	}
 
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	var navRow []tgbotapi.InlineKeyboardButton
 
-	if err := h.client.SendMessageWithButtons(chatID, "🗺 Выберите маршрут:", keyboard); err != nil {
-		logger.Log.Error("ошибка отправки кнопок", "error", err)
+	if currentPage > 0 {
+		navRow = append(navRow, tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", fmt.Sprintf("page_%s_%d", sessionID, currentPage-1)))
 	}
 
-	h.showMainMenu(chatID)
+	if currentPage < totalPages-1 {
+		navRow = append(navRow, tgbotapi.NewInlineKeyboardButtonData("Ещё маршруты ▶️", fmt.Sprintf("page_%s_%d", sessionID, currentPage+1)))
+	}
 
-	logger.Log.Info("ответ отправлен",
-		"user_id", userID,
-		"segments", len(segments),
-		"duration_ms", time.Since(start).Milliseconds(),
-	)
+	if len(navRow) > 0 {
+		rows = append(rows, navRow)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔄 Новый поиск", "new_search"),
+	))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	if state, ok := h.pageStates[chatID]; ok && state.SessionID == sessionID {
+		editMsg := tgbotapi.NewEditMessageText(chatID, state.MessageID, text)
+		editMsg.ParseMode = "Markdown"
+		editMsg.ReplyMarkup = &keyboard
+
+		_, err := h.client.GetAPI().Send(editMsg)
+		if err != nil {
+			logger.Log.Error("ошибка редактирования сообщения", "error", err)
+			h.sendNewRoutePage(chatID, text, keyboard, sessionID, currentPage, totalPages)
+		}
+	} else {
+		h.sendNewRoutePage(chatID, text, keyboard, sessionID, currentPage, totalPages)
+	}
+}
+
+func (h *Handlers) sendNewRoutePage(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup, sessionID string, currentPage, totalPages int) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+
+	sentMsg, err := h.client.GetAPI().Send(msg)
+	if err != nil {
+		logger.Log.Error("ошибка отправки маршрутов", "error", err)
+		return
+	}
+
+	h.pageStates[chatID] = &PageState{
+		MessageID:   sentMsg.MessageID,
+		SessionID:   sessionID,
+		CurrentPage: currentPage,
+		TotalPages:  totalPages,
+	}
 }
 
 func (h *Handlers) HandleText(msg *tgbotapi.Message) {
@@ -332,22 +408,314 @@ func (h *Handlers) listCameras(chatID int64) {
 	h.client.SendMessage(chatID, msg, "Markdown")
 }
 
-func (h *Handlers) getMedal(rank int) string {
-	switch rank {
-	case 1:
-		return "🥇"
-	case 2:
-		return "🥈"
-	case 3:
-		return "🥉"
-	default:
-		return "🏅"
-	}
-}
-
 func buildYandexMapsLink(startLat, startLon, endLat, endLon float64) string {
 	return fmt.Sprintf(
 		"https://yandex.ru/maps/?rtext=%.6f,%.6f~%.6f,%.6f&rtt=auto",
 		startLat, startLon, endLat, endLon,
 	)
+}
+
+// startAddCamera - начало добавления камеры
+func (h *Handlers) startAddCamera(chatID int64, userID int64) {
+	h.userStates[userID] = "adding_camera"
+
+	msg := `📷 *Добавление новой камеры*
+
+Введите координаты камеры в формате:
+` + "`широта,долгота,ограничение_скорости`" + `
+
+📝 *Пример:*
+` + "`56.240803,43.962597,60`" + `
+
+ℹ️ Ограничение скорости указывается в км/ч.
+Если ограничение неизвестно, укажите 0.
+
+📍 Или отправьте *геолокацию* камеры.
+
+⚠️ *Важно:* Камера должна находиться на расстоянии не менее 200 м от других камер.
+
+Для выхода нажмите кнопку ниже:`
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_add_camera"),
+		),
+	)
+
+	h.client.SendMessageWithButtons(chatID, msg, keyboard)
+}
+
+func (h *Handlers) handleAddCameraInput(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+	text := msg.Text
+
+	if msg.Location != nil {
+		h.handleAddCameraLocation(msg)
+		return
+	}
+
+	parts := strings.Split(text, ",")
+	if len(parts) != 3 {
+		// Показываем ошибку с кнопкой "Выйти"
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_add_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID,
+			"❌ Неверный формат. Используйте: `широта,долгота,ограничение_скорости`\n\nПример: `56.240803,43.962597,60`",
+			keyboard)
+		return
+	}
+
+	lat, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_add_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Неверный формат широты. Используйте число (например, 56.240803)", keyboard)
+		return
+	}
+
+	lon, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_add_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Неверный формат долготы. Используйте число (например, 43.962597)", keyboard)
+		return
+	}
+
+	speedLimit, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_add_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Неверный формат ограничения скорости. Используйте число (например, 60)", keyboard)
+		return
+	}
+
+	h.addCameraToDB(chatID, userID, lat, lon, speedLimit)
+}
+
+func (h *Handlers) handleAddCameraLocation(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+	lat := msg.Location.Latitude
+	lon := msg.Location.Longitude
+
+	h.userStates[userID] = "adding_camera_speed"
+	h.client.SendMessage(chatID,
+		fmt.Sprintf("📍 Получены координаты: %.6f, %.6f\n\nВведите ограничение скорости (в км/ч) или 0, если неизвестно:", lat, lon),
+		"")
+
+	h.cameraTempData[userID] = map[string]float64{
+		"lat": lat,
+		"lon": lon,
+	}
+}
+
+func (h *Handlers) handleCameraSpeedInput(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+	text := msg.Text
+
+	speedLimit, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil {
+		h.client.SendMessage(chatID, "❌ Неверный формат. Введите число (например, 60)", "")
+		return
+	}
+
+	data, exists := h.cameraTempData[userID]
+	if !exists {
+		h.client.SendMessage(chatID, "❌ Ошибка: координаты не найдены. Попробуйте снова.", "")
+		delete(h.userStates, userID)
+		return
+	}
+
+	lat := data["lat"]
+	lon := data["lon"]
+
+	h.addCameraToDB(chatID, userID, lat, lon, speedLimit)
+}
+
+func (h *Handlers) addCameraToDB(chatID int64, userID int64, lat, lon float64, speedLimit int) {
+	ctx := context.Background()
+
+	hasNearby, nearbyCam, err := h.camRepo.CheckCameraNearby(ctx, lat, lon, 200.0)
+	if err != nil {
+		logger.Log.Error("ошибка проверки камеры", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка проверки: %v", err), "")
+		return
+	}
+
+	if hasNearby {
+		msg := fmt.Sprintf(
+			"❌ *Добавление запрещено!*\n\n"+
+				"Рядом уже есть камера:\n"+
+				"📍 ID: %d\n"+
+				"📍 Координаты: `%.6f, %.6f`\n"+
+				"📏 Ограничение: %d км/ч\n"+
+				"🛣 %s\n\n"+
+				"Расстояние менее 200 метров. Добавление невозможно.",
+			nearbyCam.ID,
+			nearbyCam.Lat, nearbyCam.Lon,
+			nearbyCam.SpeedLimit,
+			nearbyCam.RoadName,
+		)
+		h.client.SendMessage(chatID, msg, "Markdown")
+		return
+	}
+
+	camera := repository.Camera{
+		Lat:        lat,
+		Lon:        lon,
+		SpeedLimit: speedLimit,
+		RoadName:   "Добавлена пользователем",
+	}
+
+	id, err := h.camRepo.AddCamera(ctx, camera)
+	if err != nil {
+		logger.Log.Error("ошибка добавления камеры", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка добавления камеры: %v", err), "")
+		return
+	}
+
+	delete(h.userStates, userID)
+	delete(h.cameraTempData, userID)
+
+	responseMsg := fmt.Sprintf(
+		"✅ *Камера успешно добавлена!*\n\n"+
+			"📍 Координаты: `%.6f, %.6f`\n"+
+			"📏 Ограничение: %d км/ч\n"+
+			"🆔 ID: %d",
+		lat, lon, speedLimit, id,
+	)
+
+	h.client.SendMessage(chatID, responseMsg, "Markdown")
+	h.showMainMenu(chatID)
+}
+
+func (h *Handlers) startDeleteCamera(chatID int64, userID int64) {
+	h.userStates[userID] = "deleting_camera"
+
+	msg := `🗑 *Удаление камеры*
+
+Введите координаты камеры, которую хотите удалить:
+` + "`широта,долгота`" + `
+
+📝 *Пример:*
+` + "`56.240803,43.962597`" + `
+
+ℹ️ Будет удалена камера с указанными координатами.
+
+Для выхода нажмите кнопку ниже:`
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+		),
+	)
+
+	h.client.SendMessageWithButtons(chatID, msg, keyboard)
+}
+
+func (h *Handlers) handleDeleteCameraInput(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+	text := msg.Text
+
+	parts := strings.Split(text, ",")
+	if len(parts) != 2 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID,
+			"❌ Неверный формат. Используйте: `широта,долгота`\n\nПример: `56.240803,43.962597`",
+			keyboard)
+		return
+	}
+
+	lat, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Неверный формат широты. Используйте число (например, 56.240803)", keyboard)
+		return
+	}
+
+	lon, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Неверный формат долготы. Используйте число (например, 43.962597)", keyboard)
+		return
+	}
+
+	if lat < -90 || lat > 90 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Широта должна быть в диапазоне от -90 до 90", keyboard)
+		return
+	}
+	if lon < -180 || lon > 180 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Выйти", "exit_delete_camera"),
+			),
+		)
+		h.client.SendMessageWithButtons(chatID, "❌ Долгота должна быть в диапазоне от -180 до 180", keyboard)
+		return
+	}
+
+	ctx := context.Background()
+	cameras, err := h.camRepo.GetCamerasByCoordinates(ctx, lat, lon)
+	if err != nil {
+		logger.Log.Error("ошибка поиска камеры", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка поиска камеры: %v", err), "")
+		return
+	}
+
+	if len(cameras) == 0 {
+		h.client.SendMessage(chatID, "❌ Камера с указанными координатами не найдена.", "")
+		return
+	}
+
+	err = h.camRepo.DeleteCamera(ctx, cameras[0].ID)
+	if err != nil {
+		logger.Log.Error("ошибка удаления камеры", "error", err)
+		h.client.SendMessage(chatID, fmt.Sprintf("❌ Ошибка удаления камеры: %v", err), "")
+		return
+	}
+
+	delete(h.userStates, userID)
+
+	responseMsg := fmt.Sprintf(
+		"✅ *Камера успешно удалена!*\n\n"+
+			"📍 Координаты: `%.6f, %.6f`\n"+
+			"📏 Ограничение: %d км/ч\n"+
+			"🆔 ID: %d",
+		cameras[0].Lat, cameras[0].Lon, cameras[0].SpeedLimit, cameras[0].ID,
+	)
+
+	h.client.SendMessage(chatID, responseMsg, "Markdown")
+	h.showMainMenu(chatID)
 }
